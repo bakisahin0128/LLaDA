@@ -2,7 +2,8 @@ import streamlit as st
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from tokenizers import Tokenizer
+from huggingface_hub import snapshot_download
 import time
 import math
 
@@ -10,7 +11,7 @@ import math
 # ADIM 1: LLaDA MODEL SINIFLARINIZ (Değişiklik yok)
 # ==============================================================================
 class LLaDAConfig:
-    def __init__(self, vocab_size=50000, max_seq_len=512, d_model=512, n_layers=16, n_heads=4, dropout=0.1):
+    def __init__(self, vocab_size=50000, max_seq_len=512, d_model=128, n_layers=16, n_heads=8, dropout=0.1):
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.d_model = d_model
@@ -43,8 +44,8 @@ class RotaryPositionalEmbedding(nn.Module):
         return self.cos[:x.shape[2], :], self.sin[:x.shape[2], :]
 
 def apply_rotary_pos_emb(q, k, cos, sin):
-    q_embed = (q * cos) + (torch.cat([-q[..., 1::2], q[..., ::2]], dim=-1) * sin)
-    k_embed = (k * cos) + (torch.cat([-k[..., 1::2], k[..., ::2]], dim=-1) * sin)
+    q_embed = (q * cos) + (torch.cat([-q[...,1::2], q[...,::2]], dim=-1) * sin)
+    k_embed = (k * cos) + (torch.cat([-k[...,1::2], k[...,::2]], dim=-1) * sin)
     return q_embed, k_embed
 
 class Attention(nn.Module):
@@ -103,16 +104,27 @@ class LLaDA_Model(nn.Module):
         return self.head(x)
 
 # ==============================================================================
-# ADIM 2: Hugging Face’dan Çekecek Şekilde Güncellenmiş Loader
+# ADIM 2: HF SNAPSHOT_DOWNLOAD İLE LOADER (GÜNCELLENDİ)
 # ==============================================================================
 @st.cache_resource(show_spinner=False)
 def load_model_and_tokenizer():
     repo_id = "ackermanBaki/llada-turkish"  # ← kendi HF repo’nuzu yazın
-    tokenizer = AutoTokenizer.from_pretrained(repo_id, use_fast=True)
-    model     = AutoModelForCausalLM.from_pretrained(repo_id)
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device).eval()
-    config = LLaDAConfig(vocab_size=tokenizer.vocab_size)
+    # 1) snapshot indirme (LFS içeriği de dahil)
+    local_dir = snapshot_download(repo_id)
+
+    # 2) tokenizer
+    tok_path = f"{local_dir}/tokenizer.json"
+    tokenizer = Tokenizer.from_file(tok_path)
+
+    # 3) model sınıfı + ağırlık yükleme
+    config = LLaDAConfig(vocab_size=tokenizer.get_vocab_size())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = LLaDA_Model(config).to(device)
+    bin_path = f"{local_dir}/pytorch_model.bin"
+    state = torch.load(bin_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
     return model, tokenizer, device, config
 
 def get_color_for_confidence(score):
@@ -122,72 +134,89 @@ def get_color_for_confidence(score):
 def render_visualization_step(placeholder, step_info):
     step, total, seq, prompt_len, tokenizer, probs = step_info
     confs, _ = torch.max(probs, dim=-1)
-    decoded = tokenizer.convert_ids_to_tokens(seq[0].tolist())
-    html = []
-    for i in range(prompt_len, len(decoded)):
-        tok = decoded[i]
+    tokens = tokenizer.convert_ids_to_tokens(seq[0].tolist())
+    html_parts = []
+    for i in range(prompt_len, len(tokens)):
+        tok = tokens[i]
         if tok == tokenizer.mask_token:
-            html.append(f'<span style="background:#333;color:#fff;padding:2px;border-radius:4px;">[MASK]</span>')
+            html_parts.append(
+                '<span style="background:#333;color:#fff;padding:2px;border-radius:4px;">[MASK]</span>')
         elif tok == tokenizer.eos_token:
-            html.append(f'<span style="background:#8A2BE2;color:#fff;padding:2px;border-radius:4px;">[EOS]</span>')
+            html_parts.append(
+                '<span style="background:#8A2BE2;color:#fff;padding:2px;border-radius:4px;">[EOS]</span>')
         else:
             score = confs[0, i-prompt_len].item()
             color = get_color_for_confidence(score)
-            html.append(f'<span title="Güven: {score:.2f}" style="background:{color};padding:2px;border-radius:4px;">{tok}</span>')
-    placeholder.markdown(f"**Adım {total-step+1}/{total}**<br>" + "".join(html), unsafe_allow_html=True)
+            html_parts.append(
+                f'<span title="Güven: {score:.2f}" style="background:{color};padding:2px;border-radius:4px;">{tok}</span>')
+    placeholder.markdown(f"**Adım {total-step+1}/{total}**<br>" + "".join(html_parts),
+                         unsafe_allow_html=True)
 
 def _run_reverse_process_st(ctx, block_len, model, tokenizer, device, steps):
-    mask_id = tokenizer.mask_token_id
+    mask_id = tokenizer.token_to_id("[MASK]")
     prompt_len = ctx.shape[1]
     current = torch.full((1, block_len), mask_id, dtype=torch.long, device=device)
     known = torch.zeros_like(current, dtype=torch.bool)
     timesteps = torch.linspace(1.0, 0.0, steps+1, device=device)
+
     for i in range(steps):
         seq = torch.cat([ctx, current], dim=1)
         with torch.no_grad():
-            logits = model(seq).logits if hasattr(model, "logits") else model(seq)
+            logits = model(seq)
         probs = F.softmax(logits, dim=-1)[:, prompt_len:]
         confs, preds = torch.max(probs, dim=-1)
+
         yield ("viz", (steps-i, steps, seq, prompt_len, tokenizer, probs))
+
         if timesteps[i+1] == 0:
-            current = preds; break
-        target_known = math.ceil((1-timesteps[i+1])*block_len)
-        to_unmask = max(0, target_known - known.sum().item())
-        if to_unmask>0:
-            cand = confs.clone(); cand[known]= -float("inf")
-            _, idxs = torch.topk(cand, k=to_unmask, dim=-1)
+            current = preds
+            break
+
+        target_known = math.ceil((1 - timesteps[i+1]) * block_len)
+        newly = max(0, target_known - known.sum().item())
+        if newly > 0:
+            cand = confs.clone()
+            cand[known] = -float("inf")
+            _, idxs = torch.topk(cand, newly, dim=-1)
             new_toks = torch.gather(preds, 1, idxs)
             current.scatter_(1, idxs, new_toks)
             known.scatter_(1, idxs, True)
+
     return current
 
 def generate_llada_st(prompt, model, tokenizer, device, block_size, num_steps, max_blocks):
-    eos_id = tokenizer.eos_token_id
+    eos_id = tokenizer.token_to_id("[EOS]")
     specials = set(tokenizer.all_special_ids)
-    enc = tokenizer(prompt, add_special_tokens=False)
-    ctx = torch.tensor([enc["input_ids"]], device=device)
+    enc = tokenizer.encode(prompt)
+    ctx = torch.tensor([enc.ids], device=device)
+
     for b in range(max_blocks):
         gen = _run_reverse_process_st(ctx, block_size, model, tokenizer, device, num_steps)
         final = None
         while True:
             try:
                 typ, data = next(gen)
-                if typ=="viz": yield ("viz", data)
+                if typ == "viz":
+                    yield ("viz", data)
             except StopIteration as e:
-                final = e.value; break
+                final = e.value
+                break
+
         block = final[0].cpu().tolist()
-        # debug
         yield ("debug", (b+1, block, tokenizer.decode(block)))
+
+        done = False
         if eos_id in block:
             idx = block.index(eos_id)
             block = block[:idx]
             done = True
-        else:
-            done = False
+
         ids = [i for i in block if i not in specials]
         if ids:
             yield ("stream", tokenizer.decode(ids))
-        if done: break
+
+        if done:
+            break
         ctx = torch.cat([ctx, final], dim=1)
 
 # ==============================================================================
@@ -207,28 +236,30 @@ with st.sidebar:
     visualization_delay  = st.slider("Görselleştirme Gecikmesi (sn)", 0.0, 1.0, 0.1, 0.05)
 
 if "messages" not in st.session_state:
-    st.session_state.messages = [ {"role":"assistant","content":"Merhaba! LLaDA modeliyle sohbet edebilirsiniz."} ]
+    st.session_state.messages = [{"role":"assistant","content":"Merhaba! LLaDA ile sohbet edebilirsiniz."}]
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if prompt := st.chat_input("Mesajınızı yazın..."):
-    st.session_state.messages.append({"role":"user","content":prompt})
+if user_input := st.chat_input("Mesajınızı yazın…"):
+    st.session_state.messages.append({"role":"user","content":user_input})
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(user_input)
     with st.chat_message("assistant"):
-        viz = st.empty()
-        debug_log = []; debug_pl = None
+        viz_pl = st.empty()
+        debug_log = []
         with st.expander("Geliştirici: Ham Üretim Günlüğü", expanded=False):
             debug_pl = st.empty()
         if not visualize_generation:
-            viz.status("Cevap üretiliyor...")
+            viz_pl.status("Cevap üretiliyor…")
+
         history = ""
         for m in st.session_state.messages[:-1]:
-            speaker = "Kullanıcı" if m["role"]=="user" else "Model"
-            history += f"{speaker}: {m['content']}\n"
-        full_prompt = history + f"Kullanıcı: {prompt}\nModel: "
+            who = "Kullanıcı" if m["role"]=="user" else "Model"
+            history += f"{who}: {m['content']}\n"
+        full_prompt = history + f"Kullanıcı: {user_input}\nModel: "
+
         def streamer():
             for typ, data in generate_llada_st(
                 prompt=full_prompt,
@@ -236,14 +267,15 @@ if prompt := st.chat_input("Mesajınızı yazın..."):
                 block_size=block_size, num_steps=num_sampling_steps, max_blocks=max_blocks
             ):
                 if typ=="viz" and visualize_generation:
-                    render_visualization_step(viz, data)
+                    render_visualization_step(viz_pl, data)
                     time.sleep(visualization_delay)
                 elif typ=="stream":
                     yield data
                 elif typ=="debug":
                     bn, ids, txt = data
-                    debug_log.append(f"**Blok {bn}:**\n- ID'ler: `{ids}`\n- Çözümlenmiş: `{txt}`")
+                    debug_log.append(f"**Blok {bn}:**\n- ID’ler: `{ids}`\n- Çözümlenmiş: `{txt}`")
                     debug_pl.markdown("\n\n".join(debug_log))
-        full_resp = st.write_stream(streamer())
-        viz.empty()
-        st.session_state.messages.append({"role":"assistant","content":full_resp})
+
+        response = st.write_stream(streamer())
+        viz_pl.empty()
+        st.session_state.messages.append({"role":"assistant","content":response})
