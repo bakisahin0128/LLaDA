@@ -108,21 +108,38 @@ class LLaDA_Model(nn.Module):
 # ==============================================================================
 @st.cache_resource(show_spinner=False)
 def load_model_and_tokenizer():
-    repo_id = "ackermanBaki/llada-turkish"  # ← kendi HF repo’nuzu yazın
-    # 1) snapshot indirme (LFS içeriği de dahil)
+    # 1) HF’den indir
+    repo_id = "kullanici_adiniz/llada-turkish"
     local_dir = snapshot_download(repo_id)
 
-    # 2) tokenizer
+    # 2) Tokenizer
     tok_path = f"{local_dir}/tokenizer.json"
     tokenizer = Tokenizer.from_file(tok_path)
 
-    # 3) model sınıfı + ağırlık yükleme
+    # 3) Model + state_dict
     config = LLaDAConfig(vocab_size=tokenizer.get_vocab_size())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = LLaDA_Model(config).to(device)
-    bin_path = f"{local_dir}/pytorch_model.bin"
-    state = torch.load(bin_path, map_location=device)
-    model.load_state_dict(state)
+
+    # 4) Dosyayı yükle
+    ckpt = torch.load(f"{local_dir}/pytorch_model.bin", map_location=device)
+    # Eğer tam bir dict ise önce doğru alt-sözlüğü alın
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+    else:
+        state_dict = ckpt
+
+    # 5) Gerekirse "module." prefix’lerini kaldır
+    def strip_prefix(sd):
+        return {k[len("module."):]: v if k.startswith("module.") else (k, v)[0]: v for k, v in sd.items()}
+    # Uygula:
+    if any(k.startswith("module.") for k in state_dict):
+        state_dict = strip_module_prefix(state_dict)
+
+    # 6) Model’e yükle
+    model.load_state_dict(state_dict)
     model.eval()
 
     return model, tokenizer, device, config
