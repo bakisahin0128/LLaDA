@@ -133,8 +133,8 @@ class LLaDA_Model(nn.Module):
 
 @st.cache_resource
 def load_model_and_tokenizer():
-    tokenizer_path = r"C:\Users\PC_4291__\Desktop\LLaDA\turkce_bpe_tokenizer.json"
-    model_path = r"C:\Users\PC_4291__\Desktop\LLaDA\llada_sft_model_final.pt"
+    tokenizer_path = "turkce_bpe_tokenizer.json"
+    model_path = "llada_sft_model_final.pt"
     tokenizer = Tokenizer.from_file(tokenizer_path)
     config = LLaDAConfig(vocab_size=tokenizer.get_vocab_size())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
